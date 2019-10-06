@@ -2,7 +2,6 @@
 package redcon
 
 import (
-	"bufio"
 	"crypto/tls"
 	"errors"
 	"io"
@@ -649,7 +648,7 @@ func (w *Writer) WriteRaw(data []byte) {
 
 // Reader represent a reader for RESP or telnet commands.
 type Reader struct {
-	rd    *bufio.Reader
+	rd    io.Reader
 	buf   []byte
 	start int
 	end   int
@@ -671,7 +670,7 @@ func NewReader(rd io.Reader) *Reader {
 // which will read RESP or telnet commands.
 func NewReaderWithOptions(rd io.Reader, opts ReaderOptions) *Reader {
 	return &Reader{
-		rd:   bufio.NewReader(rd),
+		rd:   rd,
 		buf:  make([]byte, 4096),
 		opts: opts,
 	}

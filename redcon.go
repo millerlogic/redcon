@@ -119,18 +119,8 @@ func NewServerNetwork(
 	accept func(conn Conn) bool,
 	closed func(conn Conn, err error),
 ) *Server {
-	if handler == nil {
-		panic("handler is nil")
-	}
-	s := &Server{
-		net:     net,
-		laddr:   laddr,
-		handler: handler,
-		accept:  accept,
-		closed:  closed,
-		conns:   make(map[*conn]bool),
-	}
-	return s
+	return NewServerWithOptions(Options{Network: net, Addr: laddr,
+		Handler: handler, Accept: accept, Closed: closed})
 }
 
 // NewServerNetworkTLS returns a new TLS Redcon server. The network net must be
@@ -142,21 +132,56 @@ func NewServerNetworkTLS(
 	closed func(conn Conn, err error),
 	config *tls.Config,
 ) *TLSServer {
-	if handler == nil {
+	return NewServerTLSWithOptions(Options{Network: net, Addr: laddr,
+		Handler: handler, Accept: accept, Closed: closed}, config)
+}
+
+// Options used with NewServerWithOptions or NewServerTLSWithOptions.
+// Default Network is "tcp", or set to a stream-oriented network:
+// "tcp", "tcp4", "tcp6", "unix" or "unixpacket"
+type Options struct {
+	Handler func(conn Conn, cmd Command)
+	Accept  func(conn Conn) bool
+	Closed  func(conn Conn, err error)
+	Network string
+	Addr    string
+	Reader  ReaderOptions
+}
+
+// NewServerWithOptions returns a new Redcon server with the given Options.
+func NewServerWithOptions(opts Options) *Server {
+	if opts.Handler == nil {
 		panic("handler is nil")
 	}
-	s := Server{
+	net := opts.Network
+	if net == "" {
+		net = "tcp"
+	}
+	s := &Server{
 		net:     net,
-		laddr:   laddr,
-		handler: handler,
-		accept:  accept,
-		closed:  closed,
+		laddr:   opts.Addr,
+		handler: opts.Handler,
+		accept:  opts.Accept,
+		closed:  opts.Closed,
+		rdopts:  opts.Reader,
 		conns:   make(map[*conn]bool),
 	}
+	return s
+}
 
+// NewServerWithOptions returns a new TLS Redcon server with the given Options.
+func NewServerTLSWithOptions(opts Options, config *tls.Config) *TLSServer {
+	if opts.Handler == nil {
+		panic("handler is nil")
+	}
+	net := opts.Network
+	if net == "" {
+		net = "tcp"
+	}
+	s := NewServerWithOptions(opts)
 	tls := &TLSServer{
 		config: config,
-		Server: &s,
+		Server: s,
 	}
 	return tls
 }
@@ -330,7 +355,7 @@ func serve(s *Server) error {
 			conn: lnconn,
 			addr: lnconn.RemoteAddr().String(),
 			wr:   NewWriter(lnconn),
-			rd:   NewReader(lnconn),
+			rd:   NewReaderWithOptions(lnconn, s.rdopts),
 		}
 		s.mu.Lock()
 		s.conns[c] = true
@@ -525,6 +550,7 @@ type Server struct {
 	handler func(conn Conn, cmd Command)
 	accept  func(conn Conn) bool
 	closed  func(conn Conn, err error)
+	rdopts  ReaderOptions
 	conns   map[*conn]bool
 	ln      net.Listener
 	done    bool
@@ -628,13 +654,26 @@ type Reader struct {
 	start int
 	end   int
 	cmds  []Command
+	opts  ReaderOptions
+}
+
+// ReaderOptions is used with NewReaderWithOptions.
+type ReaderOptions struct {
+	MaxBuffer int // 0 for the default, no maximum.
 }
 
 // NewReader returns a command reader which will read RESP or telnet commands.
 func NewReader(rd io.Reader) *Reader {
+	return NewReaderWithOptions(rd, ReaderOptions{})
+}
+
+// NewReaderWithOptions returns a command reader with the given options,
+// which will read RESP or telnet commands.
+func NewReaderWithOptions(rd io.Reader, opts ReaderOptions) *Reader {
 	return &Reader{
-		rd:  bufio.NewReader(rd),
-		buf: make([]byte, 4096),
+		rd:   bufio.NewReader(rd),
+		buf:  make([]byte, 4096),
+		opts: opts,
 	}
 }
 
@@ -664,8 +703,8 @@ func parseInt(b []byte) (int, bool) {
 func (rd *Reader) readCommands(leftover *int) ([]Command, error) {
 	var cmds []Command
 	b := rd.buf[rd.start:rd.end]
-	if rd.end-rd.start == 0 && len(rd.buf) > 4096 {
-		rd.buf = rd.buf[:4096]
+	if rd.end-rd.start == 0 {
+		//rd.buf = rd.buf[:4096]
 		rd.start = 0
 		rd.end = 0
 	}
@@ -858,9 +897,20 @@ func (rd *Reader) readCommands(leftover *int) ([]Command, error) {
 			rd.start, rd.end = 0, 0
 		} else {
 			// must grow the buffer
-			newbuf := make([]byte, len(rd.buf)*2)
-			copy(newbuf, rd.buf)
-			rd.buf = newbuf
+			newlen := len(rd.buf) * 2
+			if rd.opts.MaxBuffer > 0 && newlen > rd.opts.MaxBuffer {
+				newlen = rd.opts.MaxBuffer
+				if newlen <= len(rd.buf) {
+					return nil, errTooMuchData
+				}
+			}
+			if newlen <= cap(rd.buf) {
+				rd.buf = rd.buf[:newlen]
+			} else {
+				newbuf := make([]byte, newlen)
+				copy(newbuf, rd.buf)
+				rd.buf = newbuf
+			}
 		}
 	}
 	n, err := rd.rd.Read(rd.buf[rd.end:])
